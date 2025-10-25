@@ -1,0 +1,323 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>WebGL2 Tonemapping Playground</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    html, body { margin:0; height:100%; color:#000; font:20px/1.4 system-ui,-apple-system,Segoe UI,Roboto,sans-serif; background:#fff; }
+    #ui { position:fixed; top:12px; bottom:12px; left:12px; right:12px; padding:0; pointer-events:none; }
+    #fragSource { pointer-events:auto; width:100%; max-width:780px; outline:0; height:calc(100vh - 80px);
+      box-sizing:border-box; resize:vertical; color:#fff; text-shadow:1px 1px 3px #000;
+      background:transparent; border:1px solid #4440; border-radius:8px; padding:8px 10px;
+      font:16px/1.4 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; background-color:#0003; }
+    .row { display:flex; gap:8px; align-items:center; margin-top:8px; pointer-events:auto; }
+    .hint { opacity:.7; font-size:12px; }
+    .err { color:#ff3b30; white-space:pre-wrap; margin-top:6px; font-size:12px; max-width:780px; pointer-events:auto; }
+    canvas { display:block; width:100%; height:100%; }
+    .file-warning { position:fixed; inset:auto 12px 12px 12px; padding:8px 10px; background:#000c; color:#fff; border-radius:8px; }
+  </style>
+</head>
+<body>
+  <canvas id="glcanvas"></canvas>
+
+  <div id="ui">
+    <textarea id="fragSource" spellcheck="false"></textarea>
+    <div class="row"><span class="hint">Press Cmd/Ctrl+Enter to apply.</span></div>
+    <div id="compileError" class="err"></div>
+  </div>
+
+  <script>
+ 
+
+    const canvas = document.getElementById('glcanvas');
+    const gl = canvas.getContext('webgl2', { antialias:true, powerPreference:'high-performance', preserveDrawingBuffer:false });
+    
+
+    // DPR-aware resize
+    function resizeCanvas() {
+      const dpr = Math.max(1, window.devicePixelRatio || 1);
+      const w = Math.floor(canvas.clientWidth  * dpr);
+      const h = Math.floor(canvas.clientHeight * dpr);
+      if (canvas.width !== w || canvas.height !== h) {
+        canvas.width = w; canvas.height = h;
+        gl.viewport(0, 0, w, h);
+        uResolution && gl.uniform2f(uResolution, w, h);
+        draw();
+      }
+    }
+    // Stretch canvas to window
+    function fitCanvasToWindow() {
+      canvas.style.width = '100%';
+      canvas.style.height = '100%';
+      resizeCanvas();
+    }
+    window.addEventListener('resize', resizeCanvas);
+
+    // Shaders
+    const VERT_SRC = `#version 300 es
+    precision mediump float;
+    layout(location=0) in vec2 aPos;
+    layout(location=1) in vec2 aUV;
+    out vec2 vUV;
+    uniform vec2 uResolution;   // canvas pixel size
+    uniform vec2 uTexSizeBase;  // base texture size
+    uniform vec2 uTexSizeTone;  // tone map texture size
+    uniform vec4 uCoverUV;      // xy = scale, zw = offset  (for base)
+    uniform vec4 uCoverUV2;     // xy = scale, zw = offset  (for tone map)
+    void main() {
+      vUV = aUV * uCoverUV.xy + uCoverUV.zw;
+      // We’ll sample tone-map with its own transform in the fragment
+      gl_Position = vec4(aPos, 0.0, 1.0);
+    }`;
+
+    const FRAG_HEADER = `#version 300 es
+    precision mediump float;
+    in vec2 vUV;
+    out vec4 finalColor;
+    uniform sampler2D uBase;
+    uniform sampler2D uToneMap;
+    uniform vec4 uCoverUV2; // xy = scale, zw = offset (for tone-map)
+    `;
+
+    const DEFAULT_FRAG = `
+void main() {
+  vec2 uv = vUV;
+  vec2 uvTone = vUV * uCoverUV2.xy + uCoverUV2.zw;
+
+  vec4 c = texture(uBase,    uv);
+  vec4 w = texture(uToneMap, uvTone);
+
+  // Simple "brighten via max" baseline, change it in the editor.
+  finalColor = max(c, w);
+
+  // Example palette test:
+  // vec3 col = 0.5 + 0.5*cos(1.0 + 5.0*uv.xyx + vec3(0,2,4));
+  // finalColor = vec4(col, 1.0);
+}
+`.trim();
+
+    // Minimal utils
+    function compile(gl, type, src) {
+      const sh = gl.createShader(type);
+      gl.shaderSource(sh, src);
+      gl.compileShader(sh);
+      if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+        const info = gl.getShaderInfoLog(sh);
+        gl.deleteShader(sh);
+        throw new Error(info || 'shader compile failed');
+      }
+      return sh;
+    }
+    function link(gl, vs, fs) {
+      const prog = gl.createProgram();
+      gl.attachShader(prog, vs);
+      gl.attachShader(prog, fs);
+      gl.linkProgram(prog);
+      if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+        const info = gl.getProgramInfoLog(prog);
+        gl.deleteProgram(prog);
+        throw new Error(info || 'program link failed');
+      }
+      return prog;
+    }
+
+    // Fullscreen triangle (less state, no precision lost to shared edges)
+    const quadVAO = gl.createVertexArray();
+    gl.bindVertexArray(quadVAO);
+    // Positions (aPos): two triangles via 3 vertices trick
+    // We'll actually use a standard quad to keep UV simple.
+    const verts = new Float32Array([
+      //  aPos.xy     aUV.xy
+      -1, -1,        0, 0,
+       1, -1,        1, 0,
+      -1,  1,        0, 1,
+       1,  1,        1, 1,
+    ]);
+    const vbo = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+    gl.bufferData(gl.ARRAY_BUFFER, verts, gl.STATIC_DRAW);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 16, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 2, gl.FLOAT, false, 16, 8);
+    gl.bindVertexArray(null);
+
+    // Texture helpers
+    function createTextureFromImage(img) {
+      const tex = gl.createTexture();
+      gl.bindTexture(gl.TEXTURE_2D, tex);
+      gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+      gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+      gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+      gl.bindTexture(gl.TEXTURE_2D, null);
+      return tex;
+    }
+    function loadImage(url) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.crossOrigin = 'anonymous';
+        img.onload = () => resolve(img);
+        img.onerror = e => reject(e);
+        img.src = url;
+      });
+    }
+
+    // Compute "cover" UV transform (crop to fill)
+    // Returns vec4(scaleX, scaleY, offsetX, offsetY)
+    let coverUV =   (canvasW, canvasH, texW, texH)=>  {
+      const aspectCanvas = canvasW / canvasH;
+      const aspectTex = texW / texH;
+      if (aspectCanvas > aspectTex) {
+        // canvas is wider -> crop vertically
+        const s = aspectTex / aspectCanvas; // < 1
+        return [1, s, 0, (1 - s) * 0.5];
+      } else if (aspectCanvas < aspectTex) {
+        // canvas is taller -> crop horizontally
+        const s = aspectCanvas / aspectTex; // < 1
+        return [s, 1, (1 - s) * 0.5, 0];
+      } else {
+        return [1, 1, 0, 0];
+      }
+    }
+
+    let containUV = (canvasW, canvasH, texW, texH) => {
+      const aspectCanvas = canvasW / canvasH;
+      const aspectTex = texW / texH;
+      if (aspectCanvas < aspectTex) {
+        // canvas is wider -> crop vertically
+        const s = aspectTex / aspectCanvas; // < 1
+        return [1, s, 0, (1 - s) * 0.5];
+      } else if (aspectCanvas > aspectTex) {
+        // canvas is taller -> crop horizontally
+        const s = aspectCanvas / aspectTex; // < 1
+        return [s, 1, (1 - s) * 0.5, 0];
+      } else {
+        return [1, 1, 0, 0];
+      }
+    }
+
+    // overwrite
+    // coverUV = containUV;
+
+
+    // Program state
+    let program = null;
+    let uResolution, uTexSizeBase, uTexSizeTone, uCoverUV, uCoverUV2, uBase, uToneMap;
+
+    function buildProgram(fragmentSource) {
+      const vs = compile(gl, gl.VERTEX_SHADER, VERT_SRC);
+      const fs = compile(gl, gl.FRAGMENT_SHADER, FRAG_HEADER + '\n' + fragmentSource);
+      const prog = link(gl, vs, fs);
+      gl.deleteShader(vs);
+      gl.deleteShader(fs);
+      return prog;
+    }
+
+    function bindUniforms() {
+      gl.useProgram(program);
+      uResolution  = gl.getUniformLocation(program, 'uResolution');
+      uTexSizeBase = gl.getUniformLocation(program, 'uTexSizeBase');
+      uTexSizeTone = gl.getUniformLocation(program, 'uTexSizeTone');
+      uCoverUV     = gl.getUniformLocation(program, 'uCoverUV');
+      uCoverUV2    = gl.getUniformLocation(program, 'uCoverUV2');
+      uBase        = gl.getUniformLocation(program, 'uBase');
+      uToneMap     = gl.getUniformLocation(program, 'uToneMap');
+
+      // Static bindings for samplers
+      gl.uniform1i(uBase, 0);
+      gl.uniform1i(uToneMap, 1);
+
+      // Resolution set in resize
+      const w = canvas.width, h = canvas.height;
+      gl.uniform2f(uResolution, w, h);
+    }
+
+    // Resources
+    let baseImg = null, toneImg = null, baseTex = null, toneTex = null;
+
+    function draw() {
+      if (!program || !baseTex || !toneTex) return;
+
+      gl.viewport(0, 0, canvas.width, canvas.height);
+      gl.clearColor(1, 1, 1, 1);
+      gl.clear(gl.COLOR_BUFFER_BIT);
+
+      gl.useProgram(program);
+      // Update cover UVs per current sizes
+      if (baseImg) {
+        const c1 = coverUV(canvas.width, canvas.height, baseImg.width, baseImg.height);
+        gl.uniform4f(uCoverUV,  c1[0], c1[1], c1[2], c1[3]);
+        gl.uniform2f(uTexSizeBase, baseImg.width, baseImg.height);
+      }
+      if (toneImg) {
+        const c2 = coverUV(canvas.width, canvas.height, toneImg.width, toneImg.height);
+        gl.uniform4f(uCoverUV2, c2[0], c2[1], c2[2], c2[3]);
+        gl.uniform2f(uTexSizeTone, toneImg.width, toneImg.height);
+      }
+
+      // Bind textures
+      gl.activeTexture(gl.TEXTURE0);
+      gl.bindTexture(gl.TEXTURE_2D, baseTex);
+      gl.activeTexture(gl.TEXTURE1);
+      gl.bindTexture(gl.TEXTURE_2D, toneTex);
+
+      gl.bindVertexArray(quadVAO);
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      gl.bindVertexArray(null);
+    }
+
+    // UI, errors, and live compile
+    const textarea = document.getElementById('fragSource');
+    const errEl    = document.getElementById('compileError');
+    textarea.value = localStorage.WEBGL_TONEMAP_FRAG || DEFAULT_FRAG;
+
+    function applyFragment() {
+      try {
+        const src = textarea.value;
+        const newProg = buildProgram(src);
+        if (program) gl.deleteProgram(program);
+        program = newProg;
+        bindUniforms();
+        errEl.textContent = '';
+        textarea.style.borderColor = '#4440';
+        localStorage.WEBGL_TONEMAP_FRAG = src;
+        draw();
+      } catch (e) {
+        errEl.textContent = String(e && e.message ? e.message : e);
+        textarea.style.borderColor = '#e66';
+      }
+    }
+
+    textarea.addEventListener('keydown', (ev) => {
+      if ((ev.ctrlKey || ev.metaKey) && ev.key === 'Enter') {
+        ev.preventDefault();
+        applyFragment();
+      }
+    });
+
+    // Init
+    (async function init() {
+      fitCanvasToWindow();
+      // Load images
+      [baseImg, toneImg] = await Promise.all([
+        loadImage('original.png'),
+        loadImage('tonemap.png')
+      ]);
+      baseTex = createTextureFromImage(baseImg);
+      toneTex = createTextureFromImage(toneImg);
+
+      // Build first program
+      applyFragment();
+
+      // Render once initially; further draws happen on resize or shader apply
+      draw();
+    })().catch(err => {
+      errEl.textContent = 'Init failed: ' + (err && err.message ? err.message : err);
+    });
+  </script>
+</body>
+</html>
