@@ -7,6 +7,6 @@
 
 ### to run
 
-npm serve .
+npx serve .
 
 open http://localhost:3000
